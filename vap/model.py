@@ -6,7 +6,7 @@ from torch import Tensor
 from dataclasses import dataclass, field
 from typing import Dict, Tuple, List, Optional
 
-from vap.encoder import EncoderCPC
+from vap.encoder import EncoderCPC #, AcousticEncoder TODO
 from vap.objective import ObjectiveVAP
 from vap.modules import GPT, GPTStereo
 from vap.utils import (
@@ -16,14 +16,8 @@ from vap.utils import (
 )
 
 
-BIN_TIMES: list = [0.2, 0.4, 0.6, 0.8]
-
-everything_deterministic()
-
-# TODO: @dataclass and CLI arguments or is hydra the way to go?
-# TODO: Easy finetune task
-# TODO: What to evaluate
-
+# BIN_TIMES: list = [0.2, 0.4, 0.6, 0.8]
+# everything_deterministic()
 
 def load_older_state_dict(
     path="example/VAP_3mmz3t0u_50Hz_ad20s_134-epoch9-val_2.56.ckpt",
@@ -80,7 +74,8 @@ class VapConfig:
 
 
 @dataclass
-class VapMonoConfig:
+class ACGPTConfig:
+    """Mod from VapMonoConfig which takes multiple inputs (va_history and speech)"""
     sample_rate: int = 16_000
     frame_hz: int = 50
     bin_times: List[float] = field(default_factory=lambda: BIN_TIMES)
@@ -123,6 +118,10 @@ class VapMonoConfig:
 
 
 class VapGPT(nn.Module):
+    """
+    SW: this is the stereo version, which I don't think we need. Don't think there are other importance diffs 
+    between this and the VapMonoGPT (ACGPT now).
+    """
     def __init__(self, conf: Optional[VapConfig] = None):
         super().__init__()
         if conf is None:
@@ -271,18 +270,18 @@ class VapGPT(nn.Module):
         return ret
 
 
-class VapGPTMono(nn.Module):
-    def __init__(self, conf: Optional[VapMonoConfig] = None):
+class ACGPT(nn.Module):
+    def __init__(self, conf: Optional[ACGPTConfig] = None):
         super().__init__()
         if conf is None:
-            conf = VapMonoConfig()
+            conf = ACGPTConfig()
         self.conf = conf
         self.sample_rate = conf.sample_rate
         self.frame_hz = conf.frame_hz
 
         # Audio Encoder
-        self.encoder = EncoderCPC(freeze=conf.freeze_encoder)
-        self.init_va_conditioning()
+        # self.encoder = EncoderCPC(freeze=conf.freeze_encoder)
+        self.encoder = AcousticEncoder()
 
         # Single channel
         self.ar_channel = GPT(
@@ -302,22 +301,15 @@ class VapGPTMono(nn.Module):
             dropout=conf.dropout,
         )
 
-        self.objective = ObjectiveVAP(bin_times=conf.bin_times, frame_hz=conf.frame_hz)
+        self.objective = ObjectiveVAP(bin_times=conf.bin_times, frame_hz=conf.frame_hz) # TODO write
 
-        # Outputs
-        # Voice activity objective -> z -> logits ->  BCE
-        self.vap_head = nn.Linear(conf.dim, self.objective.n_classes)
-
-    def init_va_conditioning(self) -> None:
-        self.va_condition = nn.Linear(2, self.conf.dim)
-        self.va_cond_ln = nn.LayerNorm(self.conf.dim)
-        nn.init.orthogonal_(self.va_condition.weight.data)
-
-        if self.conf.va_history:
-            self.va_cond_history = nn.Linear(self.conf.va_history_bins, self.conf.dim)
+        # Outputs # SW modify config to take appropriate dims + classes (if discretizing)
+        self.word_head = nn.Linear(conf.dim, self.objective.n_classes)
+        self.duration_head = nn.Linear(conf.dim, self.objective.n_classes)
+        self.acoustic_head = nn.Linear(conf.dim, self.objective.n_classes)
 
     @torch.no_grad()
-    def probs(
+    def probs( # SW: can't see where this is used, plotting somewhere I guess? Can delete?
         self,
         waveform: Tensor,
         vad: Tensor,
@@ -368,25 +360,30 @@ class VapGPTMono(nn.Module):
         return self.encoder(audio)  # speaker 1
 
     def forward(
-        self,
-        waveform: Tensor,
-        va: Tensor,
-        va_history: Optional[Tensor] = None,
-        attention: bool = False,
-    ) -> Dict[str, Tensor]:
+            self,
+            waveform: Tensor,
+            va: Tensor,
+            va_history: Optional[Tensor] = None,
+            attention: bool = False,
+                ) -> Dict[str, Tensor]:
+        # SW: multiple inputs really are added! Should we do this instead of concat? Then input dims don't expand too much?
+        
         assert not attention, "Attention Mono model is not implemented"
+        
+        # Encode audio features
         x = self.encode_audio(waveform)
 
-        # Ugly: sometimes you may get an extra frame from waveform encoding
-        # x = x[:, : vad.shape[1]]
         # Add Vad conditioning
         x = x + self.encode_va(va, va_history)
+        
+#         # Add Vad conditioning
+#         x = x + self.encode_va(va, va_history)
 
-        # Autoregressive
+        # Autoregressive # SW: what's going on here with 2 blocks? Could be a mistake as only 1 ar call is made in the stereo version and ar_channel/ar look the same?
         x = self.ar_channel(x)["x"]
         x = self.ar(x)["x"]
 
-        # Outputs
+        # Outputs # SW obviously update
         logits = self.vap_head(x)
         ret = {"logits": logits, "vad": va}
         # if attention:
@@ -414,7 +411,7 @@ def debug_mono():
     from torch.utils.data import DataLoader
     from vap_dataset.dataset import VapDataset
 
-    conf = VapMonoConfig(mono=True, va_history=True)
+    conf = ACGPTConfig(mono=True, va_history=True)
     model = VapGPTMono(conf)
     dset = VapDataset(path="data/sliding_val.csv", mono=True)
     dloader = DataLoader(dset, batch_size=4, num_workers=1, shuffle=False)
